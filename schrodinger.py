@@ -38,6 +38,7 @@ def inner_prod(psi1, psi2, dx, dy):
     product = psi1.conj() * psi2
     integral_x = np.trapz(product, dx=dx, axis=1)
     integral_xy = np.trapz(integral_x, dx=dy)
+    # integral_xy = np.sum(product) * dx * dy
 
     return integral_xy
 
@@ -182,46 +183,126 @@ def TE_solver(potential, xrange, yrange, dt=0.1e-9, pulse_reso=10, num_evals=50)
     pls = potential.pulse.resolve(dt*pulse_reso)
 
     # initialize the fidelity array
-    F = np.zeros((num_evals, 2))
+    F = np.zeros((2, num_evals))
 
     # initial wavefunction
     _, psi_r = get_instantaneous_eigenfunction(potential, 0, xrange[0], yrange[0])
 
     # define the function of split operator method
     @jit(nopython=True, cache=True)
-    def split_operator(exp_r, eval_step, psi_r, exp_kk, pot, dt, hbar):
+    def split_operator(exp_r, eval_step, psi_r, exp_kk, pulse_reso):
         for i_step in range(eval_step):
             # time evolution (sprit operator method)
-
-            exp_r = np.exp(-1j*pot*dt/hbar/2)
-            psi_r = exp_r * psi_r
+            i_pulse = i_step // pulse_reso
+            psi_r = exp_r[i_pulse] * psi_r
             psi_p = fft.fft2(psi_r)
             psi_p = exp_kk * psi_p
             psi_r = fft.ifft2(psi_p)
-            psi_r = exp_r * psi_r
+            psi_r = exp_r[i_pulse] * psi_r
 
         return psi_r
 
 
     pot = np.zeros((eval_step, Ny, Nx))
     for i_eval in tqdm(range(0, num_evals), total=num_evals):
-        # get potential in the range
-        pls_slice = pls[i_eval*eval_step: (i_eval+1)*eval_step]
-        print(pls_slice.shape)
+        ### Aquire the potential for the current evaluation step
+        pls_slice = pls[i_eval*eval_step//pulse_reso: (i_eval+1)*eval_step//pulse_reso+1]
+        # if pls_slice.shape[0] == 0:
+        #     pls_slice = pls[i_eval*eval_step//pulse_reso]
         pot = Potential._get_potential(pls_slice, potential.gpot)
-        print(pot.shape)
+        if np.any(np.isnan(pot)):
+            print(pot)
+            raise ValueError(f"Potential contains NaN at step {i_eval}")
         exp_r = np.exp(-1j*pot*dt/hbar/2)
-        print(exp_r.shape)
-        if np.any(np.isnan(exp_r[0])):
+        if np.any(np.isnan(exp_r)):
+            print(exp_r)
             raise ValueError(f"exp_r contains NaN at step {i_eval}")
+        
         # shuttling
         psi_r = split_operator(exp_r, eval_step, psi_r, exp_kk, pulse_reso)
+        if np.any(np.isnan(psi_r)):
+            print(psi_r)
+            raise ValueError(f"psi_r contains NaN at step {i_eval}")
+        
         # evaluation
         t = tlist[i_eval*eval_step + eval_step - 1]
         _, psi_r_inst = get_instantaneous_eigenfunction(potential, t, xr[i_eval], yr[i_eval])
-        F[i_eval][0] = t
-        F[i_eval][1] = np.abs(inner_prod(psi_r, psi_r_inst, dx, dy))**2
-        print(F[i_eval][1])
-        raise ValueError("stop")
+        F[0][i_eval] = t
+        F[1][i_eval] = np.abs(inner_prod(psi_r, psi_r_inst, dx, dy))**2  # fidelity
+        if np.isnan(F[1][i_eval]):
+            raise ValueError(f"Fidelity contains NaN")
     
     return F
+
+# %%
+if __name__ == '__main__':
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import pathlib
+    import pulse_potentials as pp
+    import schrodinger as sch
+    from constants import Constants
+    from pulse_potentials import Potential
+
+    script_dir = pathlib.Path().resolve()
+    data_dir = script_dir / 'output' / 'pot'
+
+    consts = Constants('Si/SiGe')
+    gate_names = ['C1', 'C2', 'B1', 'B2', 'B3', 'B4', 'B5', 'P1', 'P2', 'P3', 'P4']
+    ppot = Potential(data_dir, gate_names, consts)
+
+    T = 1 / 1000e6  # period of the pulse (s)
+    pulse_length = 1.5 * T
+
+    A = 0.05  # amplitude of the pulse (V)
+    B = 0.73  # offset of the pulse (V)
+    dB = 0.07  # offset of the pulse for different layers (V)
+    C1 = -0.0  # lateral gate voltage (V)
+    C2 = -0.0  # lateral gate voltage (V)
+
+    def V1(t): return A * np.cos(-2*np.pi*t/T + 0  *np.pi) + B
+    def V2(t): return A * np.cos(-2*np.pi*t/T + 0.5*np.pi) + B + dB
+    def V3(t): return A * np.cos(-2*np.pi*t/T + 1  *np.pi) + B
+    def V4(t): return A * np.cos(-2*np.pi*t/T + 1.5*np.pi) + B + dB
+
+    V_list = [V1, V2, V3, V4]
+
+    voltages = {'C1': C1,
+                'C2': C2,
+                'B1': V4,
+                'P1': V1,
+                'B2': V2,
+                'P2': V3,
+                'B3': V4,
+                'P3': V1,
+                'B4': V2,
+                'P4': V3,
+                'B5': V4}
+    
+    ppot.make_pulse(pulse_length=pulse_length, pulse_shape=voltages, pulse_name='pulse1')
+
+
+    xi = -210e-9
+    yi = 0
+    xf = 210e-9
+    yf = 0
+    x_width = 100e-9
+    y_width = 100e-9
+
+    xrange = ((xi - 0.5*x_width, xi + 0.5*x_width),
+            (xf - 0.5*x_width, xf + 0.5*x_width))
+
+    yrange = ((yi - 0.5*y_width, yi + 0.5*y_width),
+            (yf - 0.5*y_width, yf + 0.5*y_width))
+    
+    dt = 1e-15
+    num_evals = 100
+    pulse_resolution = 1e-11
+
+    pulse_reso = round(pulse_resolution / dt)
+    F = sch.TE_solver(ppot, xrange, yrange, dt=dt, pulse_reso=pulse_reso, num_evals=num_evals)
+
+    plt.plot(F[0], F[1])
+    plt.xlabel('Time (s)')
+    plt.ylabel('Fidelity')
+    plt.show()
