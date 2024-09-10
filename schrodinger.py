@@ -98,7 +98,7 @@ def get_instantaneous_eigenfunction(potential, t, xrange=None, yrange=None):
     dx = x[1] - x[0]; dy = y[1] - y[0]
 
     # get the potential at time t and convert to hamiltonian
-    pot = potential.get_potential(t) * potential.consts.e  # convert to J
+    pot = potential.get_potential(t)
 
     # truncate the potential and grid if xrange and yrange are specified
     if xrange is not None:
