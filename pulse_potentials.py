@@ -22,10 +22,10 @@ class Potential:
         self.x = np.loadtxt(fdir/'x.txt', delimiter=',') * 1e-9
         self.y = np.loadtxt(fdir/'y.txt', delimiter=',') * 1e-9
         self.gpot = np.zeros((len(gate_names)+1, self.x.shape[0], self.x.shape[1]))
-        self.gpot[-1] = np.loadtxt(fdir/'zero.txt', delimiter=',')
+        self.gpot[-1] = np.loadtxt(fdir/'zero.txt', delimiter=',') * self.consts.e
 
         for gate in gate_names:
-            self.gpot[self.gate_idx[gate]] = np.loadtxt(fdir/f'{gate}_m1.txt', delimiter=',')
+            self.gpot[self.gate_idx[gate]] = np.loadtxt(fdir/f'{gate}_m1.txt', delimiter=',') * self.consts.e
     
     def get_potential(self, arg):
         """

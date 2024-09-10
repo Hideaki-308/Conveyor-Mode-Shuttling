@@ -42,6 +42,28 @@ def inner_prod(psi1, psi2, dx, dy):
 
     return integral_xy
 
+@jit(nopython=True, cache=True)
+def _get_potential(val, gpot):
+    """
+    Get the interpolated potential for a given set of voltages.
+    Same as the _get_potential method in the Potential.
+    This is for the numba jit compilation.
+
+    Parameters
+    ----------
+    val : list
+        List of gate voltages. The order of the list must match the order of gate names.
+    """
+    if val.ndim == 1:
+        val_ext = val.reshape(-1, 1, 1)
+        pot = np.sum(-val_ext * gpot, axis=0)
+        return pot
+    elif val.ndim == 2:
+        val_ext = val[:, :, np.newaxis, np.newaxis]
+        gpot_ext = gpot[np.newaxis, :, :, :]
+        pot = np.sum(-val_ext * gpot_ext, axis=1)
+        return pot
+
 def get_instantaneous_eigenfunction(potential, t, xrange=None, yrange=None):
     """
     Get the instantaneous electron eigenfunction for a given time.
@@ -180,47 +202,47 @@ def TE_solver(potential, xrange, yrange, dt=0.1e-9, pulse_reso=10, num_evals=50)
     yr = np.linspace(yrange[0], yrange[1], num_evals)
 
     # get the voltages of the pulse
-    pls = potential.pulse.resolve(dt*pulse_reso)
+    pls = potential.pulse.resolve(dt)
 
-    # initialize the fidelity array
-    F = np.zeros((2, num_evals))
+    # initialize the output arrays
+    F = np.zeros((2, num_evals))  # fidelity
+    result = np.zeros((num_evals, Ny, Nx), dtype=np.complex128)  # wavefunction
 
     # initial wavefunction
     _, psi_r = get_instantaneous_eigenfunction(potential, 0, xrange[0], yrange[0])
 
     # define the function of split operator method
     @jit(nopython=True, cache=True)
-    def split_operator(exp_r, eval_step, psi_r, exp_kk, pulse_reso):
+    def split_operator(eval_step, psi_r, exp_kk, gpot, pls_slice):
         for i_step in range(eval_step):
             # time evolution (sprit operator method)
-            i_pulse = i_step // pulse_reso
-            psi_r = exp_r[i_pulse] * psi_r
+            pot = _get_potential(pls_slice[i_step], gpot)
+            exp_r = np.exp(-1j*pot*dt/hbar/2)
+            psi_r = exp_r * psi_r
             psi_p = fft.fft2(psi_r)
             psi_p = exp_kk * psi_p
             psi_r = fft.ifft2(psi_p)
-            psi_r = exp_r[i_pulse] * psi_r
+            psi_r = exp_r * psi_r
 
         return psi_r
 
-
-    pot = np.zeros((eval_step, Ny, Nx))
     for i_eval in tqdm(range(0, num_evals), total=num_evals):
         ### Aquire the potential for the current evaluation step
-        pls_slice = pls[i_eval*eval_step//pulse_reso: (i_eval+1)*eval_step//pulse_reso+1]
-        pot = Potential._get_potential(pls_slice, potential.gpot)
-
-        exp_r = np.exp(-1j*pot*dt/hbar/2)
+        pls_slice = pls[i_eval*eval_step: (i_eval+1)*eval_step]
         
         # shuttling
-        psi_r = split_operator(exp_r, eval_step, psi_r, exp_kk, pulse_reso)
+        psi_r = split_operator(eval_step, psi_r, exp_kk, potential.gpot, pls_slice)
         
         # evaluation
         t = tlist[i_eval*eval_step + eval_step - 1]
         _, psi_r_inst = get_instantaneous_eigenfunction(potential, t, xr[i_eval], yr[i_eval])
         F[0][i_eval] = t
         F[1][i_eval] = np.abs(inner_prod(psi_r, psi_r_inst, dx, dy))**2  # fidelity
+        result[i_eval] = psi_r
+        if np.isnan(F[1][i_eval]):
+            raise ValueError("Fidelity contains NaN values.")
     
-    return F
+    return F, result
 
 # %%
 if __name__ == '__main__':
@@ -242,7 +264,7 @@ if __name__ == '__main__':
     T = 1 / 1000e6  # period of the pulse (s)
     pulse_length = 1.5 * T
 
-    A = 0.05  # amplitude of the pulse (V)
+    A = 0.2  # amplitude of the pulse (V)
     B = 0.73  # offset of the pulse (V)
     dB = 0.07  # offset of the pulse for different layers (V)
     C1 = -0.0  # lateral gate voltage (V)
