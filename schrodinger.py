@@ -207,30 +207,18 @@ def TE_solver(potential, xrange, yrange, dt=0.1e-9, pulse_reso=10, num_evals=50)
     for i_eval in tqdm(range(0, num_evals), total=num_evals):
         ### Aquire the potential for the current evaluation step
         pls_slice = pls[i_eval*eval_step//pulse_reso: (i_eval+1)*eval_step//pulse_reso+1]
-        # if pls_slice.shape[0] == 0:
-        #     pls_slice = pls[i_eval*eval_step//pulse_reso]
         pot = Potential._get_potential(pls_slice, potential.gpot)
-        if np.any(np.isnan(pot)):
-            print(pot)
-            raise ValueError(f"Potential contains NaN at step {i_eval}")
+
         exp_r = np.exp(-1j*pot*dt/hbar/2)
-        if np.any(np.isnan(exp_r)):
-            print(exp_r)
-            raise ValueError(f"exp_r contains NaN at step {i_eval}")
         
         # shuttling
         psi_r = split_operator(exp_r, eval_step, psi_r, exp_kk, pulse_reso)
-        if np.any(np.isnan(psi_r)):
-            print(psi_r)
-            raise ValueError(f"psi_r contains NaN at step {i_eval}")
         
         # evaluation
         t = tlist[i_eval*eval_step + eval_step - 1]
         _, psi_r_inst = get_instantaneous_eigenfunction(potential, t, xr[i_eval], yr[i_eval])
         F[0][i_eval] = t
         F[1][i_eval] = np.abs(inner_prod(psi_r, psi_r_inst, dx, dy))**2  # fidelity
-        if np.isnan(F[1][i_eval]):
-            raise ValueError(f"Fidelity contains NaN")
     
     return F
 
