@@ -1,46 +1,15 @@
 import numpy as np
 from numpy import fft
 import matplotlib.pyplot as plt
+import scipy
 from scipy import sparse
 from scipy.sparse.linalg import eigsh
+from scipy.linalg import eig
 from numba import jit
 from tqdm import tqdm
 from pulse_potentials import Potential
+from utility import inner_prod, generate_fructuation
 
-
-def inner_prod(psi1, psi2, dx, dy):
-    """
-    Calculate the inner product of two wavefunctions.
-
-    Parameters
-    ----------
-    psi1 : np.ndarray
-        Wavefunction 1.
-    psi2 : np.ndarray
-        Wavefunction 2.
-    dx : float
-        x grid spacing.
-    dy : float
-        y grid spacing.
-
-    Returns
-    -------
-    inner_prod : float
-        Inner product.
-    """
-    if psi1.shape != psi2.shape:
-        raise ValueError("Wavefunctions must have the same shape.")
-    if np.any(np.isnan(psi1)):
-        raise ValueError("psi1 contains NaN values.")
-    if np.any(np.isnan(psi2)):
-        raise ValueError("psi2 contains NaN values.")
-
-    product = psi1.conj() * psi2
-    integral_x = np.trapz(product, dx=dx, axis=1)
-    integral_xy = np.trapz(integral_x, dx=dy)
-    # integral_xy = np.sum(product) * dx * dy
-
-    return integral_xy
 
 @jit(nopython=True, cache=True)
 def _get_potential(val, gpot):
@@ -98,7 +67,7 @@ def get_instantaneous_eigenfunction(potential, t, xrange=None, yrange=None):
     dx = x[1] - x[0]; dy = y[1] - y[0]
 
     # get the potential at time t and convert to hamiltonian
-    pot = potential.get_potential(t)
+    pot = potential._get_potential(t)
 
     # truncate the potential and grid if xrange and yrange are specified
     if xrange is not None:
@@ -149,7 +118,7 @@ def get_instantaneous_eigenfunction(potential, t, xrange=None, yrange=None):
 
 def TE_solver(potential, xrange, yrange, dt=0.1e-9, pulse_reso=10, num_evals=50):
     """
-    Solve the time-dependent Schrodinger equation using the Split-Operator method.
+    Solve the time-dependent Schrodinger equation with spin-orbit intaraction using the Split-Operator method.
 
     Parameters
     ----------
@@ -166,6 +135,7 @@ def TE_solver(potential, xrange, yrange, dt=0.1e-9, pulse_reso=10, num_evals=50)
         The default is 10.
     num_evals : int, optional
         How many times to evaluate the shuttling. The default is 50.
+
 
     Returns
     -------
@@ -244,6 +214,178 @@ def TE_solver(potential, xrange, yrange, dt=0.1e-9, pulse_reso=10, num_evals=50)
     
     return F, result
 
+def TE_solver_with_spin(potential, xrange, yrange, dt=0.1e-9, num_evals=50,
+                        alpha=0., beta=0., theta=0., B=(0., 0., 0.),
+                        g_sd=0., g_scale=0.):
+    """
+    Solve the time-dependent Schrodinger equation with spin-orbit interaction using the Split-Operator method.
+
+    Parameters
+    ----------
+    potential : Potential
+        Potential object.
+            xrange : list of tuple
+        The range of x coordinate where the electron initially and finally should exist.
+    yrange : list of tuple
+        The range of y coordinate where the electron initially and finally should exist.
+    dt : float
+        Time step.
+    pulse_reso : int, optional
+        The time resolution of the pulse. The pulse keeps its voltage for dt*pulse_reso.
+        The default is 10.
+    num_evals : int, optional
+        How many times to evaluate the shuttling. The default is 50.
+    alpha : float, optional
+        Rashba spin-orbit coupling constant. The default is 0.
+    beta : float, optional
+        Dresselhaus spin-orbit coupling constant. The default is 0.
+    theta : float, optional
+        The angle of shuttling direction from (100). Positive is counterclockwise.
+        The default is 0.
+    B : tuple, optional
+        External magnetic field vector. The default is 0.
+    g_factor_noise : float, optional
+        Standard deviation of the g-factor noise. The default is 0.
+    g_scale : float, optional
+        The scale of fluctuation of the g-factor. The default is 0.
+
+    Returns
+    -------
+    None.
+    """
+
+    # get constants
+    ct = potential.consts
+    hbar = ct.hbar
+    g = ct.g_factor + generate_fructuation(potential, g_sd, g_scale, seed=42)
+
+    # get the grid parameters
+    X = potential.x; Y = potential.y
+    x = X[0,:]; y = Y[:,0]
+    Nx = len(x); Ny = len(y)
+    dx = x[1] - x[0]; dy = y[1] - y[0]
+    
+    # define momentum coordinates
+    dpx = 2*np.pi*hbar/(Nx*dx); dpy = 2*np.pi*hbar/(Ny*dy)
+    px = np.arange(-Nx/2, Nx/2) * dpx
+    py = np.arange(-Ny/2, Ny/2) * dpy
+    PX, PY = np.meshgrid(px, py)
+    PX = fft.ifftshift(PX)  # change the order to match the order of fft
+    PY = fft.ifftshift(PY)
+
+
+    @jit(nopython=True, cache=True)
+    def positional_operator(pot, dt, hbar, B):
+        # define the Pauli matrices
+        si = np.array([[1, 0], [0, 1]])
+        sx = np.array([[0, 1], [1, 0]])
+        sy = np.array([[0, -1j], [1j, 0]])
+        sz = np.array([[1, 0], [0, -1]])
+        shape = pot.shape
+        U = np.zeros((shape[0], shape[1], 2, 2), dtype=np.complex128)
+        for i in range(shape[0]):
+            for j in range(shape[1]):
+                ### H_r = pot(r) * si + g(r)*mu*(B[0] * sx + B[1] * sy + B[2] * sz)
+                a = g[i,j] * ct.mu_B * np.array([B[0], B[1], B[2]])  # spin coefficients
+                
+                ### U = exp(-1j * H_r * dt / hbar)
+                U_pot = np.exp(-1j * pot[i,j] * dt / hbar)
+                a_norm = np.sqrt(a[0]**2 + a[1]**2 + a[2]**2)
+                sa = (a[0] * sx + a[1] * sy + a[2] * sz)/a_norm
+                U_z = si * np.cos(a_norm * dt / hbar / 2) - 1j * sa * np.sin(a_norm * dt / hbar)
+
+                U[i,j] = U_z * U_pot
+
+        return U
+
+
+    @jit(nopython=True, cache=True)
+    def momentum_operator(PX, PY, dt, me, hbar, alpha, beta, theta):
+        # define the Pauli matrices
+        si = np.array([[1, 0], [0, 1]])
+        sx = np.array([[0, 1], [1, 0]])
+        sy = np.array([[0, -1j], [1j, 0]])
+        sz = np.array([[1, 0], [0, -1]])
+        shape = PX.shape
+        U = np.zeros((shape[0], shape[1], 2, 2), dtype=np.complex128)
+        for i in range(shape[0]):
+            for j in range(shape[1]):
+                px = PX[i,j] * np.cos(theta) - PY[i,j] * np.sin(theta)
+                py = PX[i,j] * np.sin(theta) + PY[i,j] * np.cos(theta)
+
+                ### H_p = (px**2 + py**2)/(2*me) * si - (alpha*py + beta*px) * sx + (alpha*px + beta*py) * sy
+                a = [- (alpha*py + beta*px), alpha*px + beta*py]  # spin coefficients
+                KE = (px**2 + py**2)/(2*me)  # kinetic energy
+
+                ### U = exp(-1j * H_p * dt / hbar)
+                U_KE = np.exp(-1j * KE * dt / hbar)
+
+                a_norm = np.sqrt(a[0]**2 + a[1]**2)
+                sa = (a[0] * sy + a[1] * sx)/a_norm
+                U_SO = si * np.cos(a_norm * dt / hbar) - 1j * sa * np.sin(a_norm * dt / hbar)
+
+                U[i,j] = U_SO * U_KE
+
+        return U
+    
+    exp_k = momentum_operator(PX, PY, dt, ct.me, hbar, alpha, beta, theta)
+    
+
+    # time variables
+    tlist = np.arange(0, potential.pulse['length'], dt)
+    # eval_steps = np.linspace(0, len(tlist)-1, num_evals, dtype=int)
+    eval_step = len(tlist) // num_evals
+    xr = np.linspace(xrange[0], xrange[1], num_evals)
+    yr = np.linspace(yrange[0], yrange[1], num_evals)
+
+    # get the voltages of the pulse
+    pls = potential.pulse.resolve(dt)
+
+    # initialize the output arrays
+    F = np.zeros((2, num_evals))  # fidelity
+    result = np.zeros((num_evals, Ny, Nx, 2, 1), dtype=np.complex128)  # wavefunction
+
+    # initial wavefunction (space and spin)
+    _, psi_r = get_instantaneous_eigenfunction(potential, 0, xrange[0], yrange[0])
+    sx = np.array([[0, 1], [1, 0]]); sy = np.array([[0, -1j], [1j, 0]]); sz = np.array([[1, 0], [0, -1]])
+    spinen, spineig = eig(B[0] * sx + B[1] * sy + B[2] * sz)
+    spin_ground = spineig[:, np.argmin(spinen)].reshape((2, 1))
+    psi_r = np.einsum('ij,kl->ijkl', psi_r, spineig)    
+
+    # define the function of split operator method
+    @jit(nopython=True, cache=True)
+    def split_operator(eval_step, psi_r, exp_k, gpot, pls_slice):
+        for i_step in range(eval_step):
+            # time evolution (sprit operator method)
+            pot = _get_potential(pls_slice[i_step], gpot)
+            exp_r = positional_operator(pot, dt/2, hbar, B)
+            psi_r = np.einsum('ijkl,ijlm->ijkm', exp_r, psi_r)
+            psi_p = fft.fft2(psi_r, axes=(0, 1))
+            psi_p = np.einsum('ijkl,ijlm->ijkm', exp_k, psi_p)
+            psi_r = fft.ifft2(psi_p, axes=(0, 1))
+            psi_r = np.einsum('ijkl,ijlm->ijkm', exp_r, psi_r)
+
+        return psi_r
+
+    ###### main loop ################################################################
+    for i_eval in tqdm(range(0, num_evals), total=num_evals):
+        ### aquire the potential for the current evaluation step
+        pls_slice = pls[i_eval*eval_step: (i_eval+1)*eval_step]
+        
+        # shuttling
+        psi_r = split_operator(eval_step, psi_r, exp_k, potential.gpot, pls_slice)
+        
+        # evaluation
+        # t = tlist[i_eval*eval_step + eval_step - 1]
+        # _, psi_r_inst = get_instantaneous_eigenfunction(potential, t, xr[i_eval], yr[i_eval])
+        # F[0][i_eval] = t
+        # F[1][i_eval] = np.abs(inner_prod(psi_r, psi_r_inst, dx, dy))**2  # fidelity
+        result[i_eval] = psi_r
+        if np.isnan(F[1][i_eval]):
+            raise ValueError("Fidelity contains NaN values.")
+    
+    return result
+
 # %%
 if __name__ == '__main__':
     import numpy as np
@@ -307,12 +449,7 @@ if __name__ == '__main__':
     
     dt = 1e-15
     num_evals = 100
-    pulse_resolution = 1e-11
+    result = sch.TE_solver_with_spin(ppot, xrange, yrange, dt=dt, num_evals=num_evals,
+                                     alpha=0.1, beta=0.1, theta=0., B=(0., 0., 1.),
+                                    g_sd=3., g_scale=20e-9)
 
-    pulse_reso = round(pulse_resolution / dt)
-    F = sch.TE_solver(ppot, xrange, yrange, dt=dt, pulse_reso=pulse_reso, num_evals=num_evals)
-
-    plt.plot(F[0], F[1])
-    plt.xlabel('Time (s)')
-    plt.ylabel('Fidelity')
-    plt.show()
