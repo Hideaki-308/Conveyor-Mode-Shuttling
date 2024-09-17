@@ -181,9 +181,9 @@ def TE_solver_cupy(potential, xrange, yrange, dt=0.1e-9, num_evals=50,
 
     if save_path is not None:
         # define the numpy grid for saving the wavefunction
-        x_np = cp.asnumpy(x)
-        y_np = cp.asnumpy(y)
-        z_np = np.array([0])
+        X_np = cp.asnumpy(X).reshape((Ny, Nx, 1))
+        Y_np = cp.asnumpy(Y).reshape((Ny, Nx, 1))
+        Z_np = np.zeros((Ny, Nx, 1))
         if not pathlib.Path(save_path).exists():
             pathlib.Path(save_path).mkdir(parents=True)
     
@@ -287,7 +287,7 @@ def TE_solver_cupy(potential, xrange, yrange, dt=0.1e-9, num_evals=50,
             wf_up = cp.asnumpy(cp.abs(psi_r[:,:, 0, :])**2)
             wf_dn = cp.asnumpy(cp.abs(psi_r[:,:, 1, :])**2)
             data_dict = {'spin_up': wf_up, 'spin_down': wf_dn}
-            gridToVTK(save_path + f'/wavefunction_{i_eval}', x_np, y_np, z_np, pointData=data_dict)
+            gridToVTK(save_path + f'/wavefunction_{i_eval}', X_np, Y_np, Z_np, pointData=data_dict)
 
     return result
 
