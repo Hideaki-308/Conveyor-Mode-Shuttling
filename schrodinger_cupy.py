@@ -9,6 +9,8 @@ from numba import jit
 from tqdm import tqdm
 from pulse_potentials import Potential
 from utility import inner_prod, generate_fructuation, partial_matrix_prod
+import pathlib
+from pyevtk.hl import gridToVTK
 
 
 def _get_potential(val, gpot):
@@ -31,6 +33,13 @@ def _get_potential(val, gpot):
         gpot_ext = gpot[cp.newaxis, :, :, :]
         pot = cp.sum(-val_ext * gpot_ext, axis=1)
         return pot
+    
+def check_unitary(U):
+    UdU = U.conj().swapaxes(-1, -2) @ U
+    I = cp.eye(2)
+    I = cp.ones(U.shape[:-2])[..., cp.newaxis, cp.newaxis] * I
+
+    return cp.allclose(I, UdU)
 
 def get_instantaneous_eigenfunction(potential, t, xrange=None, yrange=None):
     """
@@ -118,7 +127,7 @@ def get_instantaneous_eigenfunction(potential, t, xrange=None, yrange=None):
 
 def TE_solver_cupy(potential, xrange, yrange, dt=0.1e-9, num_evals=50,
                    alpha=0., beta=0., theta=0., B=(0., 0., 0.),
-                   g_sd=0., g_scale=10e-9):
+                   g_sd=0., g_scale=10e-9, save_path=None):
     """
     Solve the time-dependent Schrodinger equation with spin-orbit interaction using the Split-Operator method.
 
@@ -169,6 +178,14 @@ def TE_solver_cupy(potential, xrange, yrange, dt=0.1e-9, num_evals=50,
     x = X[0,:]; y = Y[:,0]
     Nx = len(x); Ny = len(y)
     dx = x[1] - x[0]; dy = y[1] - y[0]
+
+    if save_path is not None:
+        # define the numpy grid for saving the wavefunction
+        x_np = cp.asnumpy(x)
+        y_np = cp.asnumpy(y)
+        z_np = np.array([0])
+        if not pathlib.Path(save_path).exists():
+            pathlib.Path(save_path).mkdir(parents=True)
     
     # pauli matrices
     si = cp.eye(2, dtype=cp.complex128)
@@ -192,8 +209,8 @@ def TE_solver_cupy(potential, xrange, yrange, dt=0.1e-9, num_evals=50,
         ### H_r = pot(r) * si + g(r)*mu*(B[0] * sx + B[1] * sy + B[2] * sz)
         a = g[...,cp.newaxis] * muB * cp.array(B)  # spin coefficients
         a = a[..., cp.newaxis, cp.newaxis, :]
-        a_norm = cp.linalg.norm(a, axis=-1) + 1e-20
-        sa = (a[...,0] * sx + a[...,1] * sy + a[...,2] * sz) / a_norm
+        a_norm = cp.linalg.norm(a, axis=-1)
+        sa = (a[...,0] * sx + a[...,1] * sy + a[...,2] * sz) / (a_norm + 1e-20)
         U_z = si*cp.cos(a_norm*dt/hbar) - 1j*sa*cp.sin(a_norm*dt/hbar)
         U_pot = cp.exp(-1j*pot*dt/hbar)[...,cp.newaxis, cp.newaxis]
         U = U_z * U_pot
@@ -211,8 +228,8 @@ def TE_solver_cupy(potential, xrange, yrange, dt=0.1e-9, num_evals=50,
         ### H_p = (px**2 + py**2)/(2*me) * si - (alpha*py + beta*px) * sx + (alpha*px + beta*py) * sy
         a = cp.array([- (alpha*py + beta*px), alpha*px + beta*py])
         a = a[:,:,:,cp.newaxis,cp.newaxis]
-        a_norm = cp.linalg.norm(a, axis=0) + 1e-20
-        sa = (a[0] * sx + a[1] * sy) / a_norm
+        a_norm = cp.linalg.norm(a, axis=0)
+        sa = (a[0] * sx + a[1] * sy) / (a_norm + 1e-20)
         U_SO = si*cp.cos(a_norm*dt/hbar) - 1j*sa*cp.sin(a_norm*dt/hbar)
 
         KE = (px**2 + py**2)/(2*ct.me)
@@ -222,6 +239,8 @@ def TE_solver_cupy(potential, xrange, yrange, dt=0.1e-9, num_evals=50,
         return U
     
     exp_k = momentum_operator(PX, PY, dt, alpha, beta, theta)
+    # if not check_unitary(exp_k):
+    #     raise ValueError('The momentum operator is not unitary.')
 
     # time variables
     tlist = cp.arange(0, potential.pulse['length'], dt)
@@ -246,14 +265,110 @@ def TE_solver_cupy(potential, xrange, yrange, dt=0.1e-9, num_evals=50,
         pls_slice = potential.pulse.resolve(tlist_chank[i_eval])
         pot = _get_potential(pls_slice, gpot)
         exp_r = positional_operator(pot, dt/2)
+        # if not check_unitary(exp_r):
+        #     raise ValueError('The positional operator is not unitary.')
+        if not cp.all(cp.isfinite(exp_r)):
+            print(exp_r)
+            raise ValueError('unexpected value is detected in the exp_r.')
 
         for i_t in range(len(tlist_chank[i_eval])):
-            psi_r = cp.einsum('ijkl,ijlm->ijkm', exp_r[i_t], psi_r)
+            psi_r = cp.matmul(exp_r[i_t], psi_r)
             psi_k = cp.fft.fft2(psi_r, axes=(0, 1))
-            psi_k = cp.einsum('ijkl,ijlm->ijkm', exp_k, psi_k)
+            psi_k = cp.matmul(exp_k, psi_k)
             psi_r = cp.fft.ifft2(psi_k, axes=(0, 1))
-            psi_r = cp.einsum('ijkl,ijlm->ijkm', exp_r[i_t], psi_r)
+            psi_r = cp.matmul(exp_r[i_t], psi_r)
 
+        if not cp.all(cp.isfinite(psi_r)):
+            print(psi_r)
+            raise ValueError('unexpected value is detected in the wavefunction.')
         result[i_eval] = psi_r
 
+        if save_path is not None:
+            wf_up = cp.asnumpy(cp.abs(psi_r[:,:, 0, :])**2)
+            wf_dn = cp.asnumpy(cp.abs(psi_r[:,:, 1, :])**2)
+            data_dict = {'spin_up': wf_up, 'spin_down': wf_dn}
+            gridToVTK(save_path + f'/wavefunction_{i_eval}', x_np, y_np, z_np, pointData=data_dict)
+
     return result
+
+
+if __name__ == '__main__':
+    import numpy as np
+    import cupy as cp
+    import matplotlib.pyplot as plt
+    import pathlib
+    import pulse_potentials as pp
+    # import schrodinger as sch
+    import schrodinger_cupy as sch
+    from constants import Constants
+    from pulse_potentials import Potential
+
+
+    script_dir = pathlib.Path().resolve()
+    data_dir = script_dir / 'output' / 'pot'
+
+    consts = Constants('Si/SiGe')
+    gate_names = ['C1', 'C2', 'B1', 'B2', 'B3', 'B4', 'B5', 'P1', 'P2', 'P3', 'P4']
+    ppot = Potential(data_dir, gate_names, consts)
+
+    T = 1 / 1e9  # period of the pulse (s)
+    pulse_length = 1.5 * T
+
+    A = 0.2  # amplitude of the pulse (V)
+    B = 0.73  # offset of the pulse (V)
+    dB = 0.07  # offset of the pulse for different layers (V)
+    C1 = -0.0  # lateral gate voltage (V)
+    C2 = -0.0  # lateral gate voltage (V)
+
+    def V1(t): return A * np.cos(-2*np.pi*t/T + 0  *np.pi) + B
+    def V2(t): return A * np.cos(-2*np.pi*t/T + 0.5*np.pi) + B + dB
+    def V3(t): return A * np.cos(-2*np.pi*t/T + 1  *np.pi) + B
+    def V4(t): return A * np.cos(-2*np.pi*t/T + 1.5*np.pi) + B + dB
+
+    V_list = [V1, V2, V3, V4]
+
+    voltages = {'C1': C1,
+                'C2': C2,
+                'B1': V4,
+                'P1': V1,
+                'B2': V2,
+                'P2': V3,
+                'B3': V4,
+                'P3': V1,
+                'B4': V2,
+                'P4': V3,
+                'B5': V4}
+
+    ppot.make_pulse(pulse_length=pulse_length, pulse_shape=voltages, pulse_name='pulse1')
+
+    from time import time
+
+    xi = -210e-9
+    yi = 0
+    xf = 210e-9
+    yf = 0
+    x_width = 100e-9
+    y_width = 100e-9
+
+    xrange = ((xi - 0.5*x_width, xi + 0.5*x_width),
+            (xf - 0.5*x_width, xf + 0.5*x_width))
+
+    yrange = ((yi - 0.5*y_width, yi + 0.5*y_width),
+            (yf - 0.5*y_width, yf + 0.5*y_width))
+
+    dt_list = [1e-15]
+    num_evals = 1000
+    alpha = 1e-11
+    beta = 1e-11
+    theta = 0
+    Mfield = (0, 0, 0.1)
+    g_sd = 2
+    g_scale = 10e-9
+
+    for dt in dt_list:
+        print(f'dt = {dt:.0e}')
+        t0 = time()
+        result = sch.TE_solver_cupy(ppot, xrange, yrange, dt=dt, num_evals=num_evals,
+                                    alpha=alpha, beta=beta, theta=theta, B=Mfield,
+                                    g_sd=g_sd, g_scale=g_scale)
+        print(f'Elapsed time: {time() - t0:.2f} s')
