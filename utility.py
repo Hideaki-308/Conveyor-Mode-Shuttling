@@ -1,5 +1,5 @@
 import numpy as np
-from numba import jit
+from numba import jit, prange
 from scipy.ndimage import gaussian_filter
 
 
@@ -57,11 +57,47 @@ def generate_fructuation(potential, sigma, scale, seed=None):
 
     dx = potential.x[0][1] - potential.x[0][0]
     dy = potential.y[1][0] - potential.y[0][0]
-    scale_x = scale[0] / dx; scale_y = scale[1] / dy
+    scale_x = scale / dx; scale_y = scale / dy
 
-    noise = np.random.normal(0, sigma, potential.shape)
+    noise = np.random.normal(0, sigma, potential.x.shape)
     smoothed_noise = gaussian_filter(noise, sigma=(scale_x, scale_y), mode='wrap')
     scale_factor = sigma / np.std(smoothed_noise)
     smoothed_noise *= scale_factor
 
     return smoothed_noise
+
+@jit(nopython=True, parallel=True, cache=True)
+def partial_matrix_prod(A, B):
+    """
+    Calculate the product of an operator and a wavefunction, partially element-wise and partially matrix multiplication.
+
+    Parameters
+    ----------
+    A : np.ndarray
+        Array of matrices.
+    B : np.ndarray
+        Array of matrices.
+
+    Returns
+    -------
+    prod : np.ndarray
+        The result of partially matrix product.
+    """
+    s_A = A.shape; s_B = B.shape
+
+    if s_A[:-2] != s_B[:-2]:
+        raise ValueError("The arrays must have the same shape except for the last two dimensions.")
+    if s_A[-1] != s_B[-2]:
+        raise ValueError("The last two dimensions must match to perform matrix multiplication.")
+    if len(s_A) != 4 or len(s_B) != 4:
+        raise ValueError("4 dimension arrays are only supported.")
+
+    product_shape = (*s_A[:-2], s_A[-2], s_B[-1])
+    product = np.zeros(product_shape, dtype=np.complex128)
+    for i in prange(s_A[0]):
+        for j in prange(s_A[1]):
+            product[i, j] = A[i, j] @ B[i, j]
+
+    return product
+
+            

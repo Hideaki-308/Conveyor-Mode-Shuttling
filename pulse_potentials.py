@@ -1,4 +1,5 @@
 import numpy as np
+import cupy as cp
 import matplotlib.pyplot as plt
 from copy import copy, deepcopy
 from numba import jit
@@ -164,6 +165,7 @@ class Pulse(dict):
         self['name'] = pulse_name
         self['length'] = pulse_length
         self['shape'] = pulse_shape
+        self['resolution'] = 1e-9
         # assign index to each gate
         self.gate_idx = {g: i for i, g in enumerate(gate_names)}
     
@@ -216,31 +218,37 @@ class Pulse(dict):
         plt.legend()
         plt.show()
 
-    def resolve(self, dt):
+    def resolve(self, tlist):
         """
         Resolve the pulse shape to a list of voltages.
 
         Parameters
         ----------
-        dt : float
-            Time step.
+        tlist : np.ndarray
+            Array of time points.
         
         Returns
         -------
         pulse : np.ndarray
             2D array of voltages. First index is gate index and second index is time index.
         """
-        if 'voltages' in self.keys():
-            return self['voltages']
+        if isinstance(tlist, cp.ndarray):
+            lib = cp
+        elif isinstance(tlist, np.ndarray):
+            lib = np
 
-        tlist = np.arange(0, self['length'], dt)
-
-        self['voltages'] = np.zeros((len(tlist), len(self['shape'])+1))
-        self['voltages'][:,-1] = -np.ones_like(tlist)
+        self['voltages'] = lib.zeros((len(tlist), len(self['shape'])+1))
+        self['voltages'][:,-1] = -lib.ones_like(tlist)
         for g, i in self.gate_idx.items():
             if callable(self['shape'][g]):
-                self['voltages'][:,i] = np.array([self['shape'][g](t) for t in tlist])
+                self['voltages'][:,i] = lib.zeros_like(tlist)
+                for j, t in enumerate(tlist):
+                    if self['resolution'] == 0:
+                        t_ = t
+                    else:
+                        t_ = t // self['resolution'] * self['resolution']
+                    self['voltages'][j,i] = self['shape'][g](t_)
             else:
-                self['voltages'][:,i] = np.full_like(tlist, self['shape'][g])
+                self['voltages'][:,i] = lib.full_like(tlist, self['shape'][g])
 
         return self['voltages']
